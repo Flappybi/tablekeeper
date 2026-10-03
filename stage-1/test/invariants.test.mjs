@@ -1,0 +1,63 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createApp } from '../dist/app.js';
+import { demoFixture } from '../dist/demo.js';
+const fixture=()=>({users:[{id:'u_a',email:'ada@demo.invalid',password:'correct horse',display_name:'Ada'},{id:'u_b',email:'bob@demo.invalid',password:'correct horse',display_name:'Bob'}],restaurants:[{id:'r',name:'Test Restaurant',timezone:'Europe/Berlin',slot_minutes:30,reservation_duration_minutes:90,cancellation_cutoff_minutes:120,opening_hours:['mon','tue','wed','thu','fri','sat','sun'].map(weekday=>({weekday,opens:'18:00',closes:'23:00'})),tables:[{id:'t1',label:'One',capacity:2},{id:'t2',label:'Two',capacity:4}]}],reservations:[]});
+async function setup(f=fixture(),now=()=>Date.parse('2026-01-01T00:00:00Z')){const app=await createApp({now}); assert.equal((await app.inject({method:'POST',url:'/_test/reset',payload:f})).statusCode,204);const login=await app.inject({method:'POST',url:'/auth/login',payload:{email:f.users[0].email,password:f.users[0].password}});return {app,token:login.json().token};}
+function call(app,token,method,url,payload,key){return app.inject({method,url,...(payload===undefined?{}:{payload}),headers:{...(token?{authorization:`Bearer ${token}`} : {}),...(key?{'Idempotency-Key':key}:{})}});}
+const booking=(table='t1',at='19:00')=>({restaurant_id:'r',table_id:table,starts_at_local:`2026-09-24T${at}`,party_size:2});
+test('50 concurrent same-key creates produce exactly one transition and stable receipts',async()=>{const {app,token}=await setup();try{const replies=await Promise.all(Array.from({length:50},()=>call(app,token,'POST','/reservations',booking(),'same')));assert.equal(replies.filter(r=>r.statusCode===201).length,1);assert.equal(replies.filter(r=>r.statusCode===200).length,49);replies.forEach(r=>assert.deepEqual(r.json(),replies[0].json()));assert.equal((await call(app,token,'GET','/reservations')).json().reservations.length,1);}finally{await app.close();}});
+test('arbitrary past dates remain bookable and availability retains all slots',async()=>{const {app,token}=await setup(undefined,()=>Date.parse('2035-01-01T00:00:00Z'));try{const r=await call(app,token,'POST','/reservations',booking(),'past');assert.equal(r.statusCode,201);const slots=(await call(app,undefined,'GET','/availability?restaurant_id=r&date=2026-09-24&party_size=2')).json().slots;assert.equal(slots.length,8);assert.equal((await call(app,token,'POST',`/reservations/${r.json().reference}/cancel`,{})).json().error.code,'cutoff_passed');}finally{await app.close();}});
+test('atomic batch swaps commit together and conflict rollback preserves export exactly',async()=>{const {app,token}=await setup();try{const a=(await call(app,token,'POST','/reservations',booking('t1'),'a')).json(),b=(await call(app,token,'POST','/reservations',booking('t2'),'b')).json();const swap=await call(app,token,'POST','/reservation-moves',{moves:[{reference:a.reference,table_id:'t2'},{reference:b.reference,table_id:'t1'}]},'swap');assert.equal(swap.statusCode,201);const before=(await call(app,null,'GET','/_test/export')).json();const rejected=await call(app,token,'POST','/reservation-moves',{moves:[{reference:a.reference,table_id:'t1'},{reference:b.reference,table_id:'t1'}]},'failed');assert.equal(rejected.statusCode,409);assert.deepEqual((await call(app,null,'GET','/_test/export')).json(),before);}finally{await app.close();}});
+test('portable import preserves tokens, hashes, original responses after cancellation and replacement',async()=>{const {app,token}=await setup();const dst=await createApp();try{const r=await call(app,token,'POST','/reservations',booking(),'original');await call(app,token,'POST',`/reservations/${r.json().reference}/cancel`,{});const snapshot=(await call(app,null,'GET','/_test/export')).json();assert.equal((await call(dst,null,'POST','/_test/import',snapshot)).statusCode,204);const replay=await call(dst,token,'POST','/reservations',booking(),'original');assert.equal(replay.statusCode,200);assert.deepEqual(replay.json(),r.json());assert.equal((await call(dst,token,'GET',`/reservations/${r.json().reference}`)).json().status,'cancelled');const invalid=structuredClone(snapshot);invalid.state.users.push(null);assert.equal((await call(dst,null,'POST','/_test/import',invalid)).statusCode,422);assert.deepEqual((await call(dst,null,'GET','/_test/export')).json(),snapshot);assert.equal((await call(dst,null,'POST','/auth/login',{email:'ada@demo.invalid',password:'correct horse'})).statusCode,200);assert.equal((await call(dst,null,'POST','/_test/reset',{users:[],restaurants:[],reservations:[]})).statusCode,204);assert.equal((await call(dst,token,'GET','/reservations')).statusCode,401);}finally{await app.close();await dst.close();}});
+test('DST spring skips nonexistent slots; fall chooses first offset and absolute duration',async()=>{const f=fixture();f.restaurants[0].opening_hours=f.restaurants[0].opening_hours.map(h=>({...h,opens:'00:00',closes:'05:00'}));const {app,token}=await setup(f);try{const invalid=await call(app,token,'POST','/reservations',{...booking(),starts_at_local:'2026-03-29T02:30'},'spring');assert.equal(invalid.json().error.code,'invalid_local_time');const slots=(await call(app,null,'GET','/availability?restaurant_id=r&date=2026-03-29&party_size=2')).json().slots;assert(!slots.some(s=>s.starts_at_local.includes('T02:')));const fall=await call(app,token,'POST','/reservations',{...booking(),starts_at_local:'2026-10-25T02:00'},'fall');assert.equal(fall.statusCode,201);assert.equal(fall.json().starts_at,'2026-10-25T02:00:00+02:00');assert.equal(fall.json().ends_at,'2026-10-25T02:30:00+01:00');}finally{await app.close();}});
+test('idempotency checked before invalid fields; failed keys reusable; route identity isolated',async()=>{const {app,token}=await setup();try{const r=await call(app,token,'POST','/reservations',booking(),'key');assert.equal((await call(app,token,'POST','/reservations',{party_size:false},'key')).json().error.code,'idempotency_key_reuse');assert.equal((await call(app,token,'POST','/reservations',{...booking(),party_size:false},'failed')).statusCode,422);assert.equal((await call(app,token,'POST','/reservations',booking('t2'),'failed')).statusCode,201);assert.equal((await call(app,token,'POST','/reservation-moves',{moves:[{reference:r.json().reference}]},'key')).statusCode,201);const state=(await call(app,null,'GET','/_test/export')).json().state;assert.equal(state.receipts.filter(r=>r.key==='key').length,2);}finally{await app.close();}});
+test('Stage 1 ignores later fields and exposes only Stage 1 contract',async()=>{const f=fixture();f.restaurants[0].combinable=[['t1','t2']];const {app,token}=await setup(f);try{assert(!Object.hasOwn((await call(app,null,'GET','/restaurants/r')).json(),'combinable'));const avail=(await call(app,null,'GET','/availability?restaurant_id=r&date=2026-09-24&party_size=2&explain=false')).json();assert.deepEqual(Object.keys(avail.slots[0]),['starts_at_local','starts_at','available_table_ids']);const r=(await call(app,token,'POST','/reservations',{...booking(),expected_revision:0,table_ids:['t2']},'one')).json();assert(!Object.hasOwn(r,'table_ids'));assert(!Object.hasOwn(r,'revision'));assert(!Object.hasOwn(r,'accepted_terms'));for(const url of ['/','/signup','/restaurants/r/policies',`/reservations/${r.reference}/history`])assert.equal((await call(app,token,'GET',url)).statusCode,404);}finally{await app.close();}});
+test('half-open occupancy allows touching intervals and other-owner lookups remain private',async()=>{const {app,token}=await setup();try{const r=(await call(app,token,'POST','/reservations',booking(),'first')).json();assert.equal((await call(app,token,'POST','/reservations',booking('t1','20:30'),'touch')).statusCode,201);const other=(await call(app,null,'POST','/auth/login',{email:'bob@demo.invalid',password:'correct horse'})).json().token;assert.equal((await call(app,other,'GET',`/reservations/${r.reference}`)).statusCode,404);assert.equal((await call(app,other,'PATCH',`/reservations/${r.reference}`,{party_size:1})).statusCode,404);}finally{await app.close();}});
+test('bundled demo can populate a fresh empty runtime and reset repeatedly without network',async()=>{const app=await createApp();try{assert.equal((await call(app,null,'GET','/restaurants')).json().restaurants.length,0);for(let i=0;i<2;i++){assert.equal((await call(app,null,'POST','/_test/reset',demoFixture())).statusCode,204);assert.equal((await call(app,null,'GET','/restaurants')).json().restaurants.length,4);const login=(await call(app,null,'POST','/auth/login',{email:'customer@demo.invalid',password:'tablekeeper-demo'}));assert.equal(login.statusCode,200);assert.equal((await call(app,login.json().token,'GET','/reservations')).json().reservations.length,4);}}finally{await app.close();}});
+test('reset distinguishes wrong nested JSON types from invalid values and rolls back every rejection',async()=>{
+  const {app,token}=await setup();
+  try{
+    await call(app,token,'POST','/reservations',booking(),'retained');
+    const before=(await call(app,null,'GET','/_test/export')).json();
+    const cases=[
+      [f=>{f.users[0].email=123;},400],
+      [f=>{f.users={};},400],
+      [f=>{f.restaurants[0].opening_hours[0].opens=1800;},400],
+      [f=>{f.restaurants[0].opening_hours[0]=null;},400],
+      [f=>{f.restaurants[0].tables[0].capacity=true;},400],
+      [f=>{f.restaurants[0].slot_minutes='30';},400],
+      [f=>{f.restaurants[0].reservation_duration_minutes=false;},400],
+      [f=>{f.restaurants[0].cancellation_cutoff_minutes=null;},400],
+      [f=>{f.restaurants[0].timezone={};},400],
+      [f=>{f.restaurants[0].tables={};},400],
+      [f=>{f.restaurants[0].tables[0].id=5;},400],
+      [f=>{delete f.users[0].email;},422],
+      [f=>{f.restaurants[0].slot_minutes=0;},422],
+      [f=>{f.restaurants[0].tables[0].id='x'.repeat(65);},422],
+      [f=>{f.restaurants[0].opening_hours[0].opens='99:00';},422],
+      [f=>{f.reservations=[{...booking(),id:'seed1',reference:'SEED01',user_id:'u_a',party_size:false}];},422],
+      [f=>{f.reservations=[{...booking(),id:'seed1',reference:'SEED01',user_id:'u_a',reference:123}];},400],
+      [f=>{f.reservations=[{...booking(),id:'seed1',reference:'SEED01',user_id:123}];},400],
+      [f=>{f.reservations=[{...booking(),id:'seed1',reference:'SEED01',user_id:'u_a',starts_at_local:123}];},400]
+    ];
+    for(const [alter,status] of cases){const f=fixture();alter(f);const r=await call(app,null,'POST','/_test/reset',f);assert.equal(r.statusCode,status,JSON.stringify(f));assert.equal(r.json().error.code,status===400?'malformed_request':'validation_failed');assert.deepEqual((await call(app,null,'GET','/_test/export')).json(),before);}
+    const large=fixture();large.restaurants[0].slot_minutes=2880;large.restaurants[0].reservation_duration_minutes=1441;
+    assert.equal((await call(app,null,'POST','/_test/reset',large)).statusCode,204);
+    assert.deepEqual((await call(app,null,'GET','/availability?restaurant_id=r&date=2026-09-24&party_size=2')).json().slots,[]);
+    const largeExport=(await call(app,null,'GET','/_test/export')).json();
+    assert.equal((await call(app,null,'POST','/_test/import',largeExport)).statusCode,204);
+  }finally{await app.close();}
+});
+test('empty display name is valid and preserved through login and portable sessions',async()=>{
+  const app=await createApp(),dst=await createApp();
+  try{
+    const input={email:'empty@demo.invalid',password:'correct horse',display_name:''};
+    const signup=await call(app,null,'POST','/auth/signup',input);assert.equal(signup.statusCode,201);assert.equal(signup.json().display_name,'');
+    const snapshot=(await call(app,null,'GET','/_test/export')).json();assert.equal((await call(dst,null,'POST','/_test/import',snapshot)).statusCode,204);
+    assert.equal((await call(dst,signup.json().token,'GET','/reservations')).statusCode,200);
+    const login=await call(dst,null,'POST','/auth/login',{email:input.email,password:input.password});assert.equal(login.statusCode,200);assert.equal(login.json().display_name,'');
+    assert.equal((await call(dst,null,'POST','/auth/signup',{...input,email:'wrong@demo.invalid',display_name:123})).statusCode,400);
+    const {display_name,...missing}=input;assert.equal((await call(dst,null,'POST','/auth/signup',{...missing,email:'missing@demo.invalid'})).statusCode,422);
+  }finally{await app.close();await dst.close();}
+});
